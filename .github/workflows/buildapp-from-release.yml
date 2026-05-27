@@ -1,0 +1,165 @@
+name: Build sideloaded IPA from Release Assets
+
+on:
+    workflow_dispatch:
+        inputs:
+            decrypted_instagram_url:
+                description: "Direct URL to the decrypted Instagram IPA"
+                default: ""
+                required: true
+                type: string
+            release_tag:
+                description: "Release tag to pull assets from (leave empty for latest, e.g. v1.3.0)"
+                default: ""
+                required: false
+                type: string
+            upload_artifact:
+                description: "Upload artifact"
+                default: true
+                required: false
+                type: boolean
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    build:
+        name: Build RyukGram from Release
+        runs-on: macos-latest
+        permissions:
+            contents: read
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Install Dependencies
+              run: brew install dpkg
+
+            - name: Install IPA tooling (cyan + ipapatch)
+              run: |
+                pip install --force-reinstall https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+                mkdir -p "$HOME/.local/bin"
+                curl -fLo "$HOME/.local/bin/ipapatch" https://github.com/asdfzxcvbn/ipapatch/releases/download/v2.1.3/ipapatch.macos-arm64
+                chmod +x "$HOME/.local/bin/ipapatch"
+                echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+            - name: Resolve release tag
+              id: tag
+              env:
+                GH_TOKEN: ${{ github.token }}
+                INPUT_TAG: ${{ inputs.release_tag }}
+              run: |
+                set -euo pipefail
+                if [ -n "$INPUT_TAG" ]; then
+                  TAG="$INPUT_TAG"
+                else
+                  TAG="$(gh release view --repo "${{ github.repository }}" --json tagName -q .tagName)"
+                fi
+                [ -n "$TAG" ] || { echo "::error::Could not resolve release tag."; exit 1; }
+                VERSION="${TAG#v}"
+                echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+                echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+                echo "TAG=${TAG}" >> "$GITHUB_ENV"
+                echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+                echo "Using release tag: ${TAG} (version ${VERSION})"
+
+            - name: Download release assets (rootless deb + zxPluginsInject dylib)
+              env:
+                GH_TOKEN: ${{ github.token }}
+              run: |
+                set -euo pipefail
+                mkdir -p packages release-assets
+                gh release download "$TAG" \
+                  --repo "${{ github.repository }}" \
+                  --dir release-assets \
+                  --pattern "RyukGram_*_rootless.deb" \
+                  --pattern "zxPluginsInject_v*.dylib"
+                ls -la release-assets
+
+                DEB="$(ls -t release-assets/RyukGram_*_rootless.deb 2>/dev/null | head -n1 || true)"
+                ZX_DYLIB="$(ls -t release-assets/zxPluginsInject_v*.dylib 2>/dev/null | head -n1 || true)"
+                [ -n "$DEB" ] || { echo "::error::Rootless .deb not found in release $TAG."; exit 1; }
+                [ -n "$ZX_DYLIB" ] || { echo "::error::zxPluginsInject dylib not found in release $TAG."; exit 1; }
+                echo "DEB=${DEB}" >> "$GITHUB_ENV"
+                echo "ZX_DYLIB=${ZX_DYLIB}" >> "$GITHUB_ENV"
+
+            - name: Extract dylib + bundle from rootless deb
+              run: |
+                set -euo pipefail
+                STAGE="$(mktemp -d)"
+                dpkg-deb -x "$DEB" "$STAGE"
+
+                DYLIB_SRC="$(find "$STAGE" -type f -name 'RyukGram.dylib' | head -1)"
+                BUNDLE_SRC="$(find "$STAGE" -type d -name 'RyukGram.bundle' | head -1)"
+                [ -n "$DYLIB_SRC" ] || { echo "::error::RyukGram.dylib not found in deb."; exit 1; }
+                [ -n "$BUNDLE_SRC" ] || { echo "::error::RyukGram.bundle not found in deb."; exit 1; }
+
+                cp "$DYLIB_SRC" packages/RyukGram.dylib
+                rm -rf packages/RyukGram.bundle
+                cp -R "$BUNDLE_SRC" packages/RyukGram.bundle
+
+                # Match the @rpath LC that ipapatch writes into target binaries.
+                cp "$ZX_DYLIB" packages/zxPluginsInject.dylib
+                install_name_tool -id "@rpath/zxPluginsInject.dylib" packages/zxPluginsInject.dylib 2>/dev/null || true
+
+                rm -rf "$STAGE"
+                ls -la packages
+                ls -la packages/RyukGram.bundle | head -20
+
+            - name: Prepare Instagram IPA
+              env:
+                Instagram_URL: ${{ inputs.decrypted_instagram_url }}
+              run: |
+                set -euo pipefail
+                wget "$Instagram_URL" --no-verbose -O packages/com.burbn.instagram.ipa
+                ls -la packages
+
+            - name: Build sideloaded IPA (cyan + ipapatch with zxPluginsInject)
+              run: |
+                set -euo pipefail
+                rm -f packages/RyukGram-sideloaded.ipa
+                cyan \
+                  -i packages/com.burbn.instagram.ipa \
+                  -o packages/RyukGram-sideloaded.ipa \
+                  -f packages/RyukGram.dylib packages/RyukGram.bundle \
+                  -c 9 -m 15.0 -du
+
+                # Embed Safari "Open in Instagram" extension before ipapatch
+                # re-signs, so instagram.com links open the app.
+                APPEX_SRC="extensions/OpenInstagramSafariExtension.appex"
+                if [ -d "$APPEX_SRC" ]; then
+                  echo "Embedding Safari extension"
+                  INJECT_TMP="$(mktemp -d)"
+                  unzip -q packages/RyukGram-sideloaded.ipa -d "$INJECT_TMP"
+                  APP_DIR="$(find "$INJECT_TMP/Payload" -maxdepth 1 -type d -name '*.app' | head -1)"
+                  if [ -n "$APP_DIR" ]; then
+                    mkdir -p "$APP_DIR/PlugIns"
+                    rm -rf "$APP_DIR/PlugIns/OpenInstagramSafariExtension.appex"
+                    cp -R "$APPEX_SRC" "$APP_DIR/PlugIns/"
+                    ( cd "$INJECT_TMP" && zip -qr -9 ../repacked.ipa Payload )
+                    mv "$INJECT_TMP/../repacked.ipa" packages/RyukGram-sideloaded.ipa
+                  fi
+                  rm -rf "$INJECT_TMP"
+                fi
+
+                echo "Running ipapatch (zxPluginsInject LC injection)"
+                ipapatch \
+                  --input packages/RyukGram-sideloaded.ipa \
+                  --inplace --noconfirm \
+                  --dylib packages/zxPluginsInject.dylib
+
+            - name: Rename IPA
+              run: |
+                set -euo pipefail
+                mv packages/RyukGram-sideloaded.ipa "packages/RyukGram_sideloaded_v${VERSION}.ipa"
+                ls -la packages
+
+            - name: Upload IPA artifact
+              if: ${{ inputs.upload_artifact }}
+              uses: actions/upload-artifact@v4
+              with:
+                name: RyukGram_sideloaded_v${{ steps.tag.outputs.version }}
+                path: packages/RyukGram_sideloaded_v*.ipa
+                if-no-files-found: error
